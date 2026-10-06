@@ -16,7 +16,7 @@
   video{position:fixed;width:1px;height:1px;opacity:0;pointer-events:none}
 </style>
 <script type="importmap">
-{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js", "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/" } }
 </script>
 </head>
 <body>
@@ -25,12 +25,14 @@
   <p>Очки нужны с открытой задней камерой: игра покажет вашу комнату.<br>
   Сначала отметьте взглядом три свободных места на полу. Потом просто смотрите по сторонам.<br>
   Наклон головы вбок — включить свет. Тап по экрану — выход.</p>
+  <p style="font-size:12px;opacity:.45">Модель существа: «tall figure in dark», nanonova (Sketchfab), CC BY 4.0</p>
   <button id="go">Начать</button>
 </div>
 <div id="rotate">Поверните телефон горизонтально</div>
 <video id="cam" playsinline muted autoplay></video>
 <script type="module">
 import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 // 1 единица = 1 метр, глаза в начале координат, пол на y = -eyeH
 const DWELL = 1.5, ROLL_ON = 0.38, ROLL_OFF = 0.15;
@@ -123,103 +125,59 @@ function buildFallback(eyeH) {
 }
 buildFallback(1.2);
 
-// ---------- фигура: одна гладкая поверхность (SDF), нарисованная шейдером ----------
-// скелет — невидимые суставы; из отрезков между ними шейдер собирает плавное тело
-const NSEG = 20;
+// ---------- фигура: модель «tall figure in dark» (nanonova, CC BY 4.0) ----------
+const FIG_H = 2.25, NECK = new THREE.Vector3(0, 1.97, 0.04);      // шея в метрах после нормировки
 const figU = {
   time: fx.time, dissolve: { value: 1 }, room: { value: room }, light: fx.light, hide: { value: 0 },
-  A: { value: Array.from({ length: NSEG }, () => new THREE.Vector3()) },
-  B: { value: Array.from({ length: NSEG }, () => new THREE.Vector3()) },
-  RK: { value: Array.from({ length: NSEG }, () => new THREE.Vector3()) },   // r1, r2, мягкость слияния
-  invM: { value: new THREE.Matrix4() },
+  tilt: { value: 0 }, yaw: { value: 0 }, nod: { value: 0 }, neck: { value: NECK }, map: { value: null },
 };
-const BOX = { min: new THREE.Vector3(-0.6, -0.05, -0.5), max: new THREE.Vector3(0.6, 2.4, 0.55) };
 const figMat = new THREE.ShaderMaterial({
-  uniforms: { ...figU, bmin: { value: BOX.min }, bmax: { value: BOX.max } },
-  transparent: true, depthWrite: false, side: THREE.BackSide,
-  vertexShader: `varying vec3 vW; void main(){ vec4 w=modelMatrix*vec4(position,1.); vW=w.xyz; gl_Position=projectionMatrix*viewMatrix*w; }`,
-  fragmentShader: `
-    uniform vec3 A[${NSEG}], B[${NSEG}], RK[${NSEG}], room, bmin, bmax; uniform mat4 invM;
-    uniform float time, dissolve, light, hide; varying vec3 vW;
+  uniforms: figU, transparent: true,
+  vertexShader: `uniform float time, tilt, yaw, nod; uniform vec3 neck; varying vec3 vN; varying vec3 vW; varying vec2 vUv; varying vec3 vL;
+    mat3 rx(float a){ float c=cos(a), s=sin(a); return mat3(1.,0.,0., 0.,c,s, 0.,-s,c); }
+    mat3 ry(float a){ float c=cos(a), s=sin(a); return mat3(c,0.,-s, 0.,1.,0., s,0.,c); }
+    mat3 rz(float a){ float c=cos(a), s=sin(a); return mat3(c,s,0., -s,c,0., 0.,0.,1.); }
+    void main(){ vUv=uv; vec3 p=position, n=normal;
+      // голова: поворот вокруг шеи, плавный переход по шее
+      float w=smoothstep(neck.y-.1,neck.y+.04,p.y);
+      mat3 R=ry(yaw)*rz(tilt)*rx(nod);
+      p=mix(p,R*(p-neck)+neck,w); n=normalize(mix(n,R*n,w));
+      // дыхание грудью
+      float bw=smoothstep(1.35,1.6,p.y)*(1.-w); p.xz*=1.+.015*sin(time*1.1)*bw;
+      vL=p; vN=normalize(mat3(modelMatrix)*n); vec4 wp=modelMatrix*vec4(p,1.); vW=wp.xyz; gl_Position=projectionMatrix*viewMatrix*wp; }`,
+  fragmentShader: `uniform float time, dissolve, light; uniform vec3 room; uniform sampler2D map;
+    varying vec3 vN; varying vec3 vW; varying vec2 vUv; varying vec3 vL;
     ${GLSL_NOISE}
-    float smin(float a,float b,float k){ float h=max(k-abs(a-b),0.)/max(k,1e-4); return min(a,b)-h*h*k*.25; }
-    float seg(vec3 p,int i){ vec3 pa=p-A[i], ba=B[i]-A[i]; float h=clamp(dot(pa,ba)/dot(ba,ba),0.,1.);
-      return length(pa-ba*h)-mix(RK[i].x,RK[i].y,h); }
-    float map(vec3 p){ float d=1e3; for(int i=0;i<${NSEG};i++) d=smin(d,seg(p,i),RK[i].z); return d; }
     void main(){
-      if(hide>.5) discard;
-      vec3 ro=(invM*vec4(cameraPosition,1.)).xyz, rd=normalize((invM*vec4(vW,1.)).xyz-ro);
-      vec3 t0=(bmin-ro)/rd, t1=(bmax-ro)/rd; vec3 tn=min(t0,t1), tf=max(t0,t1);
-      float t=max(max(max(tn.x,tn.y),tn.z),0.), tEnd=min(min(tf.x,tf.y),tf.z);
-      float md=1e3; bool hit=false; vec3 hp;
-      for(int s=0;s<64;s++){
-        vec3 p=ro+rd*t; float d=map(p); md=min(md,d/max(t,.3)*2.5);
-        if(d<.002){ hit=true; hp=p; break; }
-        t+=max(d*.85,.004); if(t>tEnd) break;
-      }
-      float a=hit?1.:1.-smoothstep(0.,.03,md);              // мягкий размытый край, как на фото в темноте
-      if(hit){ float n=n3(hp*9.+vec3(0.,time*.35,0.))*.6+n3(hp*24.-vec3(time*.5))*.4;
-        if(n<dissolve*1.15-.08) a=0.; }
-      else a*=1.-dissolve;
-      if(a<.01) discard;
-      // не угольно-чёрная: тон комнаты, только сильно темнее
-      float rl=dot(room,vec3(.3,.5,.2));
-      vec3 c=room*.15+vec3(.003);
+      float n=n3(vL*9.+vec3(0.,time*.35,0.))*.6+n3(vL*24.-vec3(time*.5))*.4;
+      if(n<dissolve*1.15-.08) discard;                              // растворение «дымом»
+      vec3 nn=normalize(vN), v=normalize(cameraPosition-vW);
+      float fres=1.-abs(dot(nn,v));
+      float a=1.-smoothstep(.7,1.05,fres+(n-.5)*.3);                // мягкий край
+      vec3 tex=texture2D(map,vUv).rgb; float tl=dot(tex,vec3(.3,.5,.2));
+      vec3 c=room*.15+vec3(.003);                                     // тон комнаты, сильно темнее
+      c*=.85+.3*tl;                                           // немного рельефа из текстуры
+      c=mix(c,vec3(.75,.74,.68)*(.35+room*.8),smoothstep(.72,.92,tl)*.85);   // глаза и зубы светлеют
       c*=1.+light*1.5;
-      gl_FragColor=vec4(c,a*(.88-.25*light));
+      gl_FragColor=vec4(c,a*(.9-.25*light));
       #include <colorspace_fragment>
     }`,
 });
-// у материала свои ссылки на те же объекты uniform
 const fig = new THREE.Group(); fig.visible = false; scene.add(fig);
+const body = new THREE.Group(); fig.add(body);
+new GLTFLoader().load('models/figure.glb', g => {
+  g.scene.updateMatrixWorld(true);
+  g.scene.traverse(o => {
+    if (!o.isMesh) return;
+    const geo = o.geometry.clone().applyMatrix4(o.matrixWorld);
+    geo.computeBoundingBox(); const bb = geo.boundingBox, k = FIG_H / (bb.max.y - bb.min.y);
+    geo.translate(-(bb.min.x + bb.max.x) / 2, -bb.min.y, -(bb.min.z + bb.max.z) / 2).scale(k, k, k);
+    figU.map.value = o.material.map;
+    const m = new THREE.Mesh(geo, figMat); m.frustumCulled = false; body.add(m);
+  });
+});
+const J = { grin: { visible: false } };
 {
-  const box = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), figMat);
-  box.scale.subVectors(BOX.max, BOX.min); box.position.addVectors(BOX.max, BOX.min).multiplyScalar(0.5);
-  box.frustumCulled = false; fig.add(box);
-}
-const J = { grin: { visible: false } }, SEGS = [];
-function joint(parent, x, y, z) { const j = new THREE.Group(); j.position.set(x, y, z); parent.add(j); return j; }
-function bone(j, a, b, r1, r2, k = 0.05) { SEGS.push({ j, a: new THREE.Vector3(...a), b: new THREE.Vector3(...b), r1, r2, k }); }
-{
-  J.hips = joint(fig, 0, 1.06, 0);
-  bone(J.hips, [0, -0.04, 0], [0, 0.5, 0.02], 0.095, 0.12, 0.08);           // туловище, сужается к тазу
-  J.chest = joint(J.hips, 0, 0.55, 0); J.chest.rotation.x = 0.22;
-  bone(J.chest, [-0.17, 0.05, 0], [0.17, 0.05, 0], 0.055, 0.055, 0.09);      // покатые плечи
-  J.neck = joint(J.chest, 0, 0.08, 0.02); J.neck.rotation.x = 0.35;
-  bone(J.neck, [0, 0, 0], [0, 0.17, 0], 0.045, 0.04, 0.06);
-  J.head = joint(J.neck, 0, 0.18, 0.01);
-  bone(J.head, [0, 0.0, 0.0], [0, 0.2, 0.015], 0.07, 0.085, 0.05);          // вытянутая голова
-  const eyeTex = (() => { const c = makeCanvas(64, 64), x = c.getContext('2d'); const g = x.createRadialGradient(32, 32, 0, 32, 32, 32);
-    g.addColorStop(0, 'rgba(255,255,245,1)'); g.addColorStop(.15, 'rgba(235,235,220,.75)'); g.addColorStop(.45, 'rgba(200,200,180,.08)'); g.addColorStop(1, 'rgba(0,0,0,0)');
-    x.fillStyle = g; x.fillRect(0, 0, 64, 64); return new THREE.CanvasTexture(c); })();
-  J.eyes = [];
-  for (const s of [-1, 1]) {
-    const e = new THREE.Sprite(new THREE.SpriteMaterial({ map: eyeTex, transparent: true, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending }));
-    e.renderOrder = 5; e.scale.setScalar(0.045); e.position.set(s * 0.028, 0.11, 0.085); J.head.add(e); J.eyes.push(e);
-  }
-  J.arms = []; J.fingers = [];
-  for (const s of [-1, 1]) {
-    const left = s < 0;
-    const sh = joint(J.chest, s * 0.19, left ? 0.09 : 0.05, 0);
-    sh.rotation.z = s * 0.05; sh.rotation.x = left ? -0.22 : -0.38;
-    bone(sh, [0, 0, 0], [0, -0.45, 0], 0.045, 0.034, 0.05);
-    const el = joint(sh, 0, -0.45, 0); el.rotation.x = left ? -0.08 : -0.25;
-    bone(el, [0, 0, 0], [0, -0.5, 0], 0.032, 0.022, 0.03);
-    const wr = joint(el, 0, -0.5, 0);
-    bone(wr, [0, 0, 0], [0, -0.09, 0.005], 0.024, 0.02, 0.025);
-    for (const fx2 of [-0.012, 0.012]) {
-      const f = joint(wr, fx2 * s, -0.08, 0); f.userData.curl = 0.25 + Math.random() * 0.3;
-      bone(f, [0, 0, 0], [0, -0.2, 0], 0.009, 0.005, 0.012);                  // длинные пальцы
-      J.fingers.push(f);
-    }
-    J.arms.push({ sh, s });
-    const hip = joint(J.hips, s * 0.07, 0, 0); hip.rotation.x = -0.08;
-    bone(hip, [0, 0, 0], [0, -0.52, 0], 0.06, 0.04, 0.06);
-    const kn = joint(hip, 0, -0.52, 0); kn.rotation.x = 0.14;
-    bone(kn, [0, 0, 0], [0, -0.5, 0], 0.038, 0.026, 0.04);
-    const ft = joint(kn, 0, -0.5, 0);
-    bone(ft, [0, -0.02, -0.02], [0, -0.03, 0.12], 0.028, 0.024, 0.03);
-  }
   // мягкая тень под ногами
   const c = makeCanvas(128, 128), x = c.getContext('2d'); const g = x.createRadialGradient(64, 64, 0, 64, 64, 64);
   g.addColorStop(0, 'rgba(0,0,0,.6)'); g.addColorStop(1, 'rgba(0,0,0,0)'); x.fillStyle = g; x.fillRect(0, 0, 128, 128);
@@ -230,33 +188,18 @@ function bone(j, a, b, r1, r2, k = 0.05) { SEGS.push({ j, a: new THREE.Vector3(.
   g2.addColorStop(0, 'rgba(0,0,0,.6)'); g2.addColorStop(.5, 'rgba(0,0,0,.3)'); g2.addColorStop(1, 'rgba(0,0,0,0)');
   x2.fillStyle = g2; x2.fillRect(0, 0, 128, 128);
   J.aura = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c2), transparent: true, depthWrite: false }));
-  J.aura.scale.set(1.8, 2.8, 1); J.aura.renderOrder = -4; scene.add(J.aura);
+  J.aura.scale.set(1.8, 2.9, 1); J.aura.renderOrder = -4; scene.add(J.aura);
 }
-console.assert(SEGS.length === NSEG, 'NSEG', SEGS.length);
-const segV = new THREE.Vector3();
-function updateSegments() {
-  fig.updateMatrixWorld(true);
-  figU.invM.value.copy(fig.matrixWorld).invert();
-  SEGS.forEach((g, i) => {
-    figU.A.value[i].copy(g.a).applyMatrix4(g.j.matrixWorld).applyMatrix4(figU.invM.value);
-    figU.B.value[i].copy(g.b).applyMatrix4(g.j.matrixWorld).applyMatrix4(figU.invM.value);
-    figU.RK.value[i].set(g.r1, g.r2, g.k);
-  });
-}
-let headTilt = 0.5, headTiltTarget = 0.5, jerkT = 3, headYaw = 0, glitchT = 4;
+let headTilt = 0.35, headTiltTarget = 0.35, jerkT = 3, headYaw = 0, glitchT = 4;
 function animateFigure(dt, frozen, t) {
   if (!frozen) {
-    J.chest.scale.y = 1 + 0.014 * Math.sin(t * 1.1) + (Math.random() < 0.2 ? (Math.random() - 0.5) * 0.008 : 0);
-    J.fingers.forEach((f, i) => {
-      const tw = Math.sin(t * 0.9 + i * 1.7) * Math.sin(t * 0.31 + i);
-      f.rotation.x = f.userData.curl + 0.35 * Math.max(0, tw - 0.4);
-    });
     jerkT -= dt;
-    if (jerkT < 0) { jerkT = 3 + Math.random() * 6; headTiltTarget = (Math.random() < 0.75 ? 1 : -1) * (0.25 + Math.random() * 0.45); }
+    if (jerkT < 0) { jerkT = 3 + Math.random() * 6; headTiltTarget = (Math.random() < 0.75 ? 1 : -1) * (0.15 + Math.random() * 0.4); }
     headTilt += (headTiltTarget - headTilt) * Math.min(1, dt * 18);          // резкий рывок головы
+    body.rotation.z = 0.012 * Math.sin(t * 0.37);                           // еле заметное покачивание
     glitchT -= dt;
     if (glitchT < 0) {                                     // сбой: мерцание и голова выворачивается
-      if (glitchT > -0.45) { figU.hide.value = Math.random() < 0.35 ? 1 : 0; headTilt = 1.3 * Math.sign(headTilt || 1); }
+      if (glitchT > -0.45) { figU.hide.value = Math.random() < 0.35 ? 1 : 0; headTilt = 1.2 * Math.sign(headTilt || 1); }
       else { figU.hide.value = 0; glitchT = 6 + Math.random() * 9; }
     }
   }
@@ -264,12 +207,12 @@ function animateFigure(dt, frozen, t) {
   const toCam = fig.worldToLocal(camera.position.clone());
   const want = Math.max(-1, Math.min(1, Math.atan2(toCam.x, toCam.z)));
   headYaw += (want - headYaw) * Math.min(1, dt * 0.4);
-  J.head.rotation.set(-0.45, headYaw, headTilt);
-  updateSegments();
-  const d = figU.dissolve.value, vis = figU.hide.value ? 0 : 1;
-  J.eyes.forEach(e => e.material.opacity = vis * (0.5 + 0.15 * Math.sin(t * 7.3) * Math.sin(t * 2.1)) * (1 - d) * (1 - fx.light.value));
+  figU.tilt.value = headTilt; figU.yaw.value = headYaw;
+  figU.nod.value = Math.atan2(toCam.y - NECK.y, Math.hypot(toCam.x, toCam.z)) * -0.6;   // смотрит на вас сверху вниз
+  body.visible = !figU.hide.value;
+  const d = figU.dissolve.value;
   J.shadow.material.opacity = (1 - d) * 0.8;
-  J.aura.position.copy(fig.position).add(new THREE.Vector3(0, 1.15, 0)).addScaledVector(tmp.copy(fig.position).sub(camera.position).setY(0).normalize(), 0.25);
+  J.aura.position.copy(fig.position).add(new THREE.Vector3(0, 1.2, 0)).addScaledVector(tmp.copy(fig.position).sub(camera.position).setY(0).normalize(), 0.25);
   J.aura.material.opacity = 0.45 * (1 - d) * (1 - fx.light.value * 0.7);
 }
 
