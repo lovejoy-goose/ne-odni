@@ -125,18 +125,26 @@ buildFallback(1.2);
 
 // ---------- фигура ----------
 const figU = { time: fx.time, dissolve: { value: 1 }, room: { value: room }, light: fx.light };
-const makeFigMat = shroud => new THREE.ShaderMaterial({
-  uniforms: figU, transparent: true, side: shroud ? THREE.DoubleSide : THREE.FrontSide,
-  defines: shroud ? { SHROUD: 1 } : {},
-  vertexShader: `uniform float time; varying vec3 vN; varying vec3 vW; varying vec2 vUv;
+const makeFigMat = kind => new THREE.ShaderMaterial({        // kind: body | SHROUD | SKIN | HAIR
+  uniforms: figU, transparent: true, side: kind === 'SHROUD' || kind === 'HAIR' ? THREE.DoubleSide : THREE.FrontSide,
+  defines: kind === 'body' ? {} : { [kind]: 1 },
+  vertexShader: `uniform float time; varying vec3 vN; varying vec3 vW; varying vec2 vUv; varying float vK;
+    #ifdef HAIR
+      attribute float k;
+    #endif
     ${GLSL_NOISE}
-    void main(){ vUv=uv; vec3 p=position;
+    void main(){ vUv=uv; vec3 p=position; vK=0.;
+      #ifdef HAIR
+        vK=k;                                              // волосы колышутся сильнее к концам
+        p.x+=(n3(vec3(p.xy*7.,time*.35))-.5)*.07*k*k;
+        p.z+=(n3(vec3(p.zy*7.+3.,time*.3))-.5)*.05*k*k;
+      #endif
       #ifdef SHROUD
         float k=1.-uv.y;                                   // низ савана колышется сильнее
         p.xz+=normalize(p.xz)*(n3(vec3(p.xz*6.,time*.4+p.y*3.))-.5)*.09*k;
       #endif
       vN=normalize(mat3(modelMatrix)*normal); vec4 w=modelMatrix*vec4(p,1.); vW=w.xyz; gl_Position=projectionMatrix*viewMatrix*w; }`,
-  fragmentShader: `uniform float time, dissolve, light; uniform vec3 room; varying vec3 vN; varying vec3 vW; varying vec2 vUv;
+  fragmentShader: `uniform float time, dissolve, light; uniform vec3 room; varying vec3 vN; varying vec3 vW; varying vec2 vUv; varying float vK;
     ${GLSL_NOISE}
     void main(){
       #ifdef SHROUD
@@ -150,16 +158,25 @@ const makeFigMat = shroud => new THREE.ShaderMaterial({
       float a=1.-smoothstep(.5,1.,fres+(n-.5)*.6);                   // рваный дымный край
       a*=1.-smoothstep(.0,.2,dissolve*1.15-.08-n+.2)*0.;
       vec3 base=vec3(.004,.004,.005)+room*.04+room*.1*max(dot(nn,normalize(vec3(.2,1.,.4))),0.);
+      #ifdef SKIN
+        float sl=.45+.55*max(dot(nn,normalize(vec3(.2,1.,.4))),0.);
+        base=vec3(.05,.052,.045)*(.35+room*3.)*sl*(.8+.4*n3(vW*60.));   // бледная иссохшая кожа
+        a=max(a,.9);
+      #endif
+      #ifdef HAIR
+        base=vec3(.003)+room*.03;
+        a=(1.-smoothstep(.7,1.,vK))*.95;
+      #endif
       base*=1.+light*2.5;
       gl_FragColor=vec4(base,a*.95);
       #include <colorspace_fragment>
     }`,
 });
-const figMat = makeFigMat(false), shroudMat = makeFigMat(true);
+const figMat = makeFigMat('body'), shroudMat = makeFigMat('SHROUD'), skinMat = makeFigMat('SKIN'), hairMat = makeFigMat('HAIR');
 const fig = new THREE.Group(); fig.visible = false; scene.add(fig);
 const J = {};
-function capsule(r, len, parent, y, sx = 1, sz = 1) {
-  const m = new THREE.Mesh(new THREE.CapsuleGeometry(r, len, 6, 14), figMat);
+function capsule(r, len, parent, y, sx = 1, sz = 1, mat = figMat) {
+  const m = new THREE.Mesh(new THREE.CapsuleGeometry(r, len, 6, 14), mat);
   m.position.y = y; m.scale.set(sx, 1, sz); parent.add(m); return m;
 }
 function joint(parent, x, y, z) { const j = new THREE.Group(); j.position.set(x, y, z); parent.add(j); return j; }
@@ -182,21 +199,54 @@ function joint(parent, x, y, z) { const j = new THREE.Group(); j.position.set(x,
   J.eyes = [];
   for (const s of [-1, 1]) {
     const e = new THREE.Sprite(new THREE.SpriteMaterial({ map: eyeTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, opacity: 0.3 }));
-    e.scale.setScalar(0.035); e.position.set(s * 0.033, 0.13, 0.1); J.head.add(e); J.eyes.push(e);
+    e.material.depthTest = false; e.renderOrder = 5;
+    e.scale.setScalar(0.03); e.position.set(s * 0.031, 0.13, 0.12); J.head.add(e); J.eyes.push(e);
+  }
+  // длинные спутанные волосы, закрывающие лицо
+  {
+    const N = 170, SEG = 8, pos = [], kk = [], idx = []; let v = 0;
+    for (let i = 0; i < N; i++) {
+      const a = Math.random() * Math.PI * 2, el = 0.15 + Math.random() * 1.2;
+      const root = new THREE.Vector3(Math.cos(el) * Math.sin(a) * 0.09, 0.11 + Math.sin(el) * 0.14, Math.cos(el) * Math.cos(a) * 0.105);
+      const out = new THREE.Vector3(root.x, 0, root.z).normalize();
+      const L = 0.45 + Math.random() * 0.45, w = 0.01 + Math.random() * 0.012;
+      const side = new THREE.Vector3(-out.z, 0, out.x).multiplyScalar(w / 2);
+      for (let j = 0; j <= SEG; j++) {
+        const k = j / SEG, c = root.clone().addScaledVector(out, 0.035 * Math.sqrt(k) + 0.01).add(new THREE.Vector3(0, -L * k, 0));
+        pos.push(c.x - side.x, c.y, c.z - side.z, c.x + side.x, c.y, c.z + side.z); kk.push(k, k);
+        if (j < SEG) idx.push(v, v + 1, v + 2, v + 1, v + 3, v + 2);
+        v += 2;
+      }
+      v += 0;
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('k', new THREE.Float32BufferAttribute(kk, 1));
+    g.setIndex(idx); g.computeVertexNormals();
+    const hair = new THREE.Mesh(g, hairMat); hair.frustumCulled = false; J.head.add(hair);
   }
   J.arms = []; J.fingers = [];
   for (const s of [-1, 1]) {
-    const sh = joint(J.chest, s * 0.2, 0.07, 0);
-    sh.rotation.z = s * 0.1; sh.rotation.x = -0.2;
-    capsule(0.038, 0.4, sh, -0.22);
-    const el = joint(sh, 0, -0.44, 0); el.rotation.x = -0.12;
-    capsule(0.03, 0.46, el, -0.25);
-    const wr = joint(el, 0, -0.5, 0);
-    capsule(0.028, 0.08, wr, -0.05, 1.3, 0.6);
-    for (let i = 0; i < 4; i++) {
-      const f = joint(wr, (i - 1.5) * 0.017 * s, -0.1, 0);
-      capsule(0.005, 0.25 - Math.abs(i - 1.5) * 0.03, f, -0.13);
-      J.fingers.push(f);
+    const left = s < 0;                                     // левое плечо задрано, как вывихнутое
+    const sh = joint(J.chest, s * 0.2, left ? 0.13 : 0.06, 0);
+    sh.rotation.z = s * (left ? 0.12 : 0.06); sh.rotation.x = left ? -0.2 : -0.4;
+    capsule(0.036, 0.4, sh, -0.22);
+    const el = joint(sh, 0, -0.44, 0); el.rotation.x = left ? -0.1 : -0.3;
+    capsule(0.024, 0.48, el, -0.26, 1, 1, skinMat);
+    const elb = new THREE.Mesh(new THREE.SphereGeometry(0.03, 12, 8), skinMat); el.add(elb);
+    const wr = joint(el, 0, -0.52, 0);
+    capsule(0.022, 0.07, wr, -0.045, 1.4, 0.55, skinMat);
+    for (let i = 0; i < 5; i++) {
+      const th = i === 4;
+      const f = joint(wr, th ? s * 0.03 : (i - 1.5) * 0.016 * s, th ? -0.05 : -0.095, th ? 0.015 : 0);
+      if (th) f.rotation.z = s * 0.5;
+      const L1 = th ? 0.06 : 0.13 - Math.abs(i - 1.5) * 0.015, L2 = th ? 0.05 : 0.11 - Math.abs(i - 1.5) * 0.012;
+      capsule(0.0055, L1, f, -L1 / 2 - 0.004, 1, 1, skinMat);
+      const m = joint(f, 0, -L1 - 0.008, 0);
+      const kn = new THREE.Mesh(new THREE.SphereGeometry(0.0085, 8, 6), skinMat); m.add(kn);
+      capsule(0.0045, L2, m, -L2 / 2 - 0.004, 1, 1, skinMat);
+      m.userData.curl = 0.35 + Math.random() * 0.5;
+      J.fingers.push(m);
     }
     J.arms.push({ sh, el, s });
     const hip = joint(J.hips, s * 0.08, 0, 0); hip.rotation.x = -0.1;
@@ -212,12 +262,19 @@ function joint(parent, x, y, z) { const j = new THREE.Group(); j.position.set(x,
   J.shadow = new THREE.Mesh(new THREE.PlaneGeometry(1.0, 0.75), new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthWrite: false }));
   J.shadow.rotation.x = -Math.PI / 2; J.shadow.position.y = 0.01; J.shadow.renderOrder = -5; fig.add(J.shadow);
 }
-let headTilt = 0.5, headTiltTarget = 0.5, jerkT = 3, headYaw = 0;
+let headTilt = 0.5, headTiltTarget = 0.5, jerkT = 3, headYaw = 0, glitchT = 4;
 function animateFigure(dt, frozen, t) {
   if (!frozen) {
-    J.chest.scale.y = 1 + 0.012 * Math.sin(t * 1.1);
-    J.fingers.forEach((f, i) => f.rotation.x = 0.15 * Math.sin(t * 0.7 + i * 1.7) * Math.sin(t * 0.23 + i));
-    J.arms.forEach(a => a.sh.rotation.x = -0.2 + 0.03 * Math.sin(t * 0.5 + a.s));
+    J.chest.scale.y = 1 + 0.014 * Math.sin(t * 1.1) + (Math.random() < 0.2 ? (Math.random() - 0.5) * 0.008 : 0);
+    J.fingers.forEach((f, i) => {
+      const tw = Math.sin(t * 0.9 + i * 1.7) * Math.sin(t * 0.31 + i);
+      f.rotation.x = f.userData.curl + 0.35 * Math.max(0, tw - 0.4) * (Math.random() < 0.3 ? 1.6 : 1);
+    });
+    glitchT -= dt;
+    if (glitchT < 0) {                                     // сбой: мерцание и голова выворачивается
+      if (glitchT > -0.5) { J.hips.visible = Math.random() < 0.6; headTilt = 1.35 * Math.sign(headTilt || 1); }
+      else { J.hips.visible = true; glitchT = 5 + Math.random() * 8; }
+    }
     jerkT -= dt;
     if (jerkT < 0) { jerkT = 3 + Math.random() * 6; headTiltTarget = (Math.random() < 0.75 ? 1 : -1) * (0.3 + Math.random() * 0.5); }
     headTilt += (headTiltTarget - headTilt) * Math.min(1, dt * 18);          // резкий рывок головы
