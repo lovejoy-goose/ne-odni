@@ -23,7 +23,7 @@
 <div id="start">
   <h1>НЕ ОДНИ</h1>
   <p>Очки нужны с открытой задней камерой: игра покажет вашу комнату.<br>
-  Сначала отметьте взглядом три свободных места на полу. Потом просто смотрите по сторонам.<br>
+  Сядьте или встаньте посреди комнаты и просто смотрите по сторонам.<br>
   Наклон головы вбок — включить свет. Тап по экрану — выход.</p>
   <p style="font-size:12px;opacity:.45">Модель существа: «tall figure in dark», nanonova (Sketchfab), CC BY 4.0</p>
   <button id="go">Начать</button>
@@ -292,12 +292,55 @@ addEventListener('keydown', e => {           // Q/E — имитация нак�
 });
 addEventListener('keyup', e => { if ('qeйу'.includes(e.key)) fakeRoll = 0; });
 
+// ---------- звук: фоновый гул и пространственные шаги/шёпот (CC0, OpenGameArt) ----------
+const SND = {}; let master = null, drone = null, droneGain = null;
+function initAudio() {
+  if (master) return;
+  master = audio.createGain(); master.connect(audio.destination);
+  ['drone', 'step1', 'step2', 'step3', 'step4', 'switch', 'whisper1', 'whisper2', 'whisper3', 'whisper4'].forEach(n =>
+    fetch(`snd/${n}.m4a`).then(r => r.arrayBuffer()).then(b => audio.decodeAudioData(b)).then(buf => { SND[n] = buf; }).catch(() => {}));
+}
+function startDrone() {
+  if (drone || !SND.drone) return;
+  drone = audio.createBufferSource(); drone.buffer = SND.drone; drone.loop = true;
+  drone.loopStart = 0.05; drone.loopEnd = SND.drone.duration - 0.05;
+  droneGain = audio.createGain(); droneGain.gain.value = 0;
+  drone.connect(droneGain).connect(master); drone.start();
+}
+function play3D(name, pos, vol = 1, rate = 1, delay = 0) {
+  if (!master || !SND[name]) return;
+  const src = audio.createBufferSource(); src.buffer = SND[name]; src.playbackRate.value = rate;
+  const g = audio.createGain(); g.gain.value = vol;
+  const pn = audio.createPanner(); pn.panningModel = 'HRTF'; pn.distanceModel = 'inverse'; pn.refDistance = 1; pn.rolloffFactor = 1;
+  if (pn.positionX) { pn.positionX.value = pos.x; pn.positionY.value = pos.y; pn.positionZ.value = pos.z; } else pn.setPosition(pos.x, pos.y, pos.z);
+  src.connect(g).connect(pn).connect(master); src.start(audio.currentTime + delay);
+}
+function steps(pos, n = 2) {
+  for (let i = 0; i < n; i++) play3D('step' + (1 + Math.floor(Math.random() * 4)), pos, 0.9, rnd(0.8, 0.95), i * rnd(0.45, 0.6));
+}
+function murmur(pos, n = 5) {                  // короткие шёпоты склеиваются в бормотание
+  let t = 0;
+  for (let i = 0; i < n; i++) { const r = rnd(0.65, 0.85); play3D('whisper' + (1 + Math.floor(Math.random() * 4)), pos, 0.8, r, t); t += rnd(0.12, 0.3) / r; }
+}
+const upV = new THREE.Vector3();
+function updateListener(dt) {
+  if (!master) return;
+  const L = audio.listener; upV.set(0, 1, 0).applyQuaternion(camera.quaternion);
+  if (L.forwardX) { L.forwardX.value = fwd.x; L.forwardY.value = fwd.y; L.forwardZ.value = fwd.z; L.upX.value = upV.x; L.upY.value = upV.y; L.upZ.value = upV.z; }
+  else L.setOrientation(fwd.x, fwd.y, fwd.z, upV.x, upV.y, upV.z);
+  if (vr && mode === 'play') startDrone();
+  if (droneGain) {
+    const want = !vr ? 0 : finale >= 3 ? 0.9 * (1 - fx.fade.value) : [0.35, 0.5, 0.7][phase] * (lightT > 0 ? 0.4 : 1);
+    droneGain.gain.value += (want - droneGain.gain.value) * Math.min(1, dt * 1.5);
+  }
+}
+
 // ---------- вход и выход ----------
 let vr = false, audio = null;
 const startEl = document.getElementById('start'), rotateEl = document.getElementById('rotate');
 document.getElementById('go').addEventListener('click', () => {
   // всё в том же тапе, до любого await
-  try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); audio.resume(); } catch {}
+  try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); audio.resume(); initAudio(); } catch {}
   if (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function') {
     DeviceOrientationEvent.requestPermission().then(s => { if (s === 'granted') addEventListener('deviceorientation', onOrient); }).catch(() => {});
   } else addEventListener('deviceorientation', onOrient);
@@ -348,10 +391,16 @@ const marker = new THREE.Mesh(new THREE.RingGeometry(0.16, 0.2, 48), new THREE.M
 marker.rotation.x = -Math.PI / 2; marker.renderOrder = 18; marker.visible = false; scene.add(marker);
 const spotMarks = new THREE.Group(); scene.add(spotMarks);
 function startCalibration() {
-  mode = 'choose'; spots = []; spotMarks.clear(); choice.visible = true; fig.visible = false;
-  fx.fade.value = 0; finale = 0;
-  showPanel('Вы сидите или стоите?\nЗадержите взгляд на ответе', 999);
-  panel.m.position.y = 0.12;
+  // места появления выбираются сами: 10 направлений вокруг, 2–3,5 м
+  eyeH = 1.4; buildFallback(eyeH);
+  spots = Array.from({ length: 10 }, (_, i) => {
+    const a = i / 10 * Math.PI * 2 + rnd(-0.15, 0.15), d = rnd(2, 3.5);
+    return new THREE.Vector3(Math.sin(a) * d, 0, -Math.cos(a) * d);
+  });
+  spotMarks.clear(); choice.visible = false; fig.visible = false; fx.fade.value = 0; finale = 0;
+  mode = 'play'; T = 0; figState = 'hidden'; figTimer = 6; flickT = 30; dwellKey = null;
+  panel.m.position.y = 0;
+  showPanel('Просто смотрите по сторонам.', 4);
   if (params.has('show')) {               // ?show — сразу показать фигуру впереди (для проверки)
     mode = 'debug'; choice.visible = false; panelTimer = 0;
     placeFig(new THREE.Vector3(0.3, 0, -2.4)); fig.visible = true; figU.dissolve.value = 0;
@@ -380,10 +429,12 @@ function spawn() {
   if (phase === 2) p.multiplyScalar(Math.max(1.0 / p.length(), rnd(0.35, 0.55)));
   placeFig(p); fig.visible = true; figState = 'in'; figU.dissolve.value = 1; seenT = 0; outT = 0;
   if (phase === 2) flick(0.2);
+  if (Math.random() < 0.6) steps(fig.position.clone().setY(-eyeH + 0.1), 1);
   return true;
 }
 function flick(len) { flickT = -len; }
 
+let whisperT = 12;
 function story(dt) {
   T += dt * TS;
   phase = T < 90 ? 0 : T < 200 ? 1 : 2;
@@ -399,11 +450,20 @@ function story(dt) {
   fx.light.value += ((lightT > 0 ? 1 : 0) - fx.light.value) * Math.min(1, dt * 4);
 
   J.grin.visible = phase === 2 || finale > 0;
+  if (phase === 2 && !finale) {                   // шёпот у самого уха
+    whisperT -= dt;
+    if (whisperT < 0) {
+      whisperT = rnd(8, 15) / TS;
+      const side = new THREE.Vector3(Math.random() < 0.5 ? -1 : 1, 0, 0).applyQuaternion(camera.quaternion).multiplyScalar(0.35);
+      murmur(side.add(fwd.clone().multiplyScalar(-0.15)), 5);
+    }
+  }
   if (finale) return storyFinale(dt, a);
   if (T > 270) {                              // финал: она оказывается прямо за спиной
     if (figState === 'hidden' || a > D2R(70)) {
       const back = fwd.clone().setY(0).normalize().multiplyScalar(-0.85);
       placeFig(back); fig.visible = true; figU.dissolve.value = 0; figState = 'final'; finale = 1; finaleT = 0;
+      murmur(back.clone().setY(0.1), 7);
     }
   }
 
@@ -423,7 +483,7 @@ function story(dt) {
     else if (a > D2R(70)) {
       outT += dt * TS;
       if (phase === 2 && outT > 3) {                                     // подходит ближе, пока не смотрите
-        outT = 0; const p = fig.position.clone().setY(0); if (p.length() > 1.0) placeFig(p.multiplyScalar(0.8));
+        outT = 0; const p = fig.position.clone().setY(0); if (p.length() > 1.0) { placeFig(p.multiplyScalar(0.8)); steps(fig.position.clone().setY(-eyeH + 0.1), 2); }
       }
     }
   }
@@ -454,6 +514,7 @@ function frame() {
   else camera.quaternion.setFromEuler(new THREE.Euler(-mPitch, -mYaw, fakeRoll, 'YXZ'));
   camera.updateMatrixWorld();
   camera.getWorldDirection(fwd);
+  updateListener(dt);
 
   if (vr) {
     const roll = rollEuler.setFromQuaternion(camera.quaternion, 'YXZ').z;
@@ -500,6 +561,7 @@ function frame() {
       }
     } else if (mode === 'play') {
       if (tilted && finale === 0) {
+        play3D('switch', new THREE.Vector3(0.3, 0.2, -0.3), 0.8);
         if (lightCD <= 0) { lightT = 3; lightCD = 15; } else showPanel('Свет не включается…', 2);
       }
       story(dt);
