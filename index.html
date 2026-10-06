@@ -155,16 +155,14 @@ const makeFigMat = kind => new THREE.ShaderMaterial({        // kind: body | SHR
       if(n<dissolve*1.15-.08) discard;                              // растворение «дымом»
       vec3 nn=normalize(vN), v=normalize(cameraPosition-vW);
       float fres=1.-abs(dot(nn,v));
-      float a=1.-smoothstep(.5,1.,fres+(n-.5)*.6);                   // рваный дымный край
+      float a=1.-smoothstep(.25,.95,fres+(n-.5)*.5);                 // мягкий, размытый край тени
       a*=1.-smoothstep(.0,.2,dissolve*1.15-.08-n+.2)*0.;
-      vec3 base=vec3(.004,.004,.005)+room*.04+room*.1*max(dot(nn,normalize(vec3(.2,1.,.4))),0.);
+      vec3 base=vec3(.0015)+room*.006;                                // чистая тень, без бликов
       #ifdef SKIN
-        float sl=.45+.55*max(dot(nn,normalize(vec3(.2,1.,.4))),0.);
-        base=vec3(.05,.052,.045)*(.35+room*3.)*sl*(.8+.4*n3(vW*60.));   // бледная иссохшая кожа
-        a=max(a,.9);
+        a=max(a,.8);
       #endif
       #ifdef HAIR
-        base=vec3(.003)+room*.03;
+        base=vec3(.0015);
         a=(1.-smoothstep(.7,1.,vK))*.95;
       #endif
       base*=1.+light*2.5;
@@ -194,13 +192,13 @@ function joint(parent, x, y, z) { const j = new THREE.Group(); j.position.set(x,
   head.scale.set(0.82, 1.3, 0.95); head.position.y = 0.11; J.head.add(head);
   // бледные отблески вместо глаз
   const eyeTex = (() => { const c = makeCanvas(64, 64), x = c.getContext('2d'); const g = x.createRadialGradient(32, 32, 0, 32, 32, 32);
-    g.addColorStop(0, 'rgba(230,235,240,1)'); g.addColorStop(.25, 'rgba(200,210,220,.35)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+    g.addColorStop(0, 'rgba(255,255,250,1)'); g.addColorStop(.18, 'rgba(240,240,230,.9)'); g.addColorStop(.4, 'rgba(200,200,190,.15)'); g.addColorStop(1, 'rgba(0,0,0,0)');
     x.fillStyle = g; x.fillRect(0, 0, 64, 64); return new THREE.CanvasTexture(c); })();
   J.eyes = [];
   for (const s of [-1, 1]) {
     const e = new THREE.Sprite(new THREE.SpriteMaterial({ map: eyeTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, opacity: 0.3 }));
     e.material.depthTest = false; e.renderOrder = 5;
-    e.scale.setScalar(0.03); e.position.set(s * 0.031, 0.13, 0.12); J.head.add(e); J.eyes.push(e);
+    e.scale.setScalar(0.05); e.position.set(s * 0.03, 0.13, 0.12); J.head.add(e); J.eyes.push(e);
   }
   // длинные спутанные волосы, закрывающие лицо
   {
@@ -229,7 +227,7 @@ function joint(parent, x, y, z) { const j = new THREE.Group(); j.position.set(x,
   for (const s of [-1, 1]) {
     const left = s < 0;                                     // левое плечо задрано, как вывихнутое
     const sh = joint(J.chest, s * 0.2, left ? 0.13 : 0.06, 0);
-    sh.rotation.z = s * (left ? 0.12 : 0.06); sh.rotation.x = left ? -0.2 : -0.4;
+    sh.rotation.z = s * (left ? 0.03 : 0.06); sh.rotation.x = left ? -0.2 : -0.4;
     capsule(0.036, 0.4, sh, -0.22);
     const el = joint(sh, 0, -0.44, 0); el.rotation.x = left ? -0.1 : -0.3;
     capsule(0.024, 0.48, el, -0.26, 1, 1, skinMat);
@@ -255,6 +253,26 @@ function joint(parent, x, y, z) { const j = new THREE.Group(); j.position.set(x,
     capsule(0.042, 0.46, kn, -0.25);
     const ft = joint(kn, 0, -0.5, 0.03);
     const foot = capsule(0.035, 0.14, ft, 0); foot.rotation.x = Math.PI / 2;
+  }
+  // бледная широкая улыбка — появляется ближе к концу
+  {
+    const c = makeCanvas(256, 128), x = c.getContext('2d');
+    x.fillStyle = '#d8d6c8';
+    x.beginPath(); x.moveTo(8, 22); x.quadraticCurveTo(128, 175, 248, 22); x.quadraticCurveTo(128, 60, 8, 22); x.fill();
+    x.strokeStyle = 'rgba(0,0,0,.95)'; x.lineWidth = 5;
+    for (let i = 1; i < 14; i++) { const xx = 8 + i * 17.1; x.beginPath(); x.moveTo(xx, 10); x.lineTo(xx + (xx - 128) * 0.08, 125); x.stroke(); }
+    x.lineWidth = 4; x.beginPath(); x.moveTo(20, 40); x.quadraticCurveTo(128, 120, 236, 40); x.stroke();
+    const g = x.createRadialGradient(128, 64, 10, 128, 64, 130); g.addColorStop(.6, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,1)');
+    x.globalCompositeOperation = 'destination-out'; x.fillStyle = g; x.fillRect(0, 0, 256, 128);
+    J.grin = new THREE.Mesh(new THREE.PlaneGeometry(0.2, 0.1), new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthTest: false, depthWrite: false }));
+    J.grin.position.set(0, 0.035, 0.125); J.grin.renderOrder = 5; J.grin.visible = false; J.head.add(J.grin);
+  }
+  {
+    const c = makeCanvas(128, 128), x = c.getContext('2d'); const g = x.createRadialGradient(64, 64, 0, 64, 64, 64);
+    g.addColorStop(0, 'rgba(0,0,0,.9)'); g.addColorStop(.5, 'rgba(0,0,0,.5)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+    x.fillStyle = g; x.fillRect(0, 0, 128, 128);
+    J.aura = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthWrite: false }));
+    J.aura.scale.set(1.8, 2.8, 1); J.aura.renderOrder = -4; scene.add(J.aura);
   }
   // мягкая тень под ногами
   const c = makeCanvas(128, 128), x = c.getContext('2d'); const g = x.createRadialGradient(64, 64, 0, 64, 64, 64);
@@ -285,7 +303,11 @@ function animateFigure(dt, frozen, t) {
   headYaw += (want - headYaw) * Math.min(1, dt * 0.4);
   J.head.rotation.set(-0.5, headYaw, headTilt);
   const d = figU.dissolve.value;
-  J.eyes.forEach(e => e.material.opacity = 0.3 * (1 - d) * (1 - fx.light.value));
+  J.eyes.forEach(e => e.material.opacity = (0.75 + 0.2 * Math.sin(t * 7.3) * Math.sin(t * 2.1)) * (1 - d) * (1 - fx.light.value));
+  J.grin.material.opacity = (J.grin.visible ? 0.85 : 0) * (1 - d) * (1 - fx.light.value);
+  // тьма вокруг фигуры чуть позади неё
+  J.aura.position.copy(fig.position).add(new THREE.Vector3(0, 1.15, 0)).addScaledVector(tmp.copy(fig.position).sub(camera.position).setY(0).normalize(), 0.25);
+  J.aura.material.opacity = 0.6 * (1 - d) * (1 - fx.light.value * 0.7); J.aura.visible = fig.visible;
   J.shadow.material.opacity = 1 - d;
 }
 
@@ -471,6 +493,7 @@ function story(dt) {
   lightCD -= dt; lightT -= dt;
   fx.light.value += ((lightT > 0 ? 1 : 0) - fx.light.value) * Math.min(1, dt * 4);
 
+  J.grin.visible = phase === 2 || finale > 0;
   if (finale) return storyFinale(dt, a);
   if (T > 270) {                              // финал: она оказывается прямо за спиной
     if (figState === 'hidden' || a > D2R(70)) {
@@ -577,7 +600,8 @@ function frame() {
       story(dt);
       if (fig.visible) animateFigure(dt, figState === 'present' && seenT > 0 && angleToFig() < D2R(14), fx.time.value);
     }
-    if (mode === 'debug') animateFigure(dt, false, fx.time.value);
+    if (mode === 'debug') { J.grin.visible = params.has('grin'); animateFigure(dt, false, fx.time.value); }
+    J.aura.visible = fig.visible;
     drawReticle(Math.min(1, prog), showRet);
     panelTimer -= dt;
     panel.m.material.opacity = Math.max(0, Math.min(1, panelTimer));
