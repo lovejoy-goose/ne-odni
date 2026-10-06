@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Не одни</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;color:#d8d8d8;font-family:-apple-system,system-ui,sans-serif;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none}
+  canvas{display:block}
+  #start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;background:#050505;text-align:center;padding:24px}
+  #start h1{margin:0;font-weight:300;letter-spacing:.35em;font-size:32px}
+  #start p{margin:0;max-width:460px;opacity:.75;line-height:1.45;font-size:15px}
+  #go{font-size:20px;padding:14px 40px;border-radius:30px;border:1px solid #666;background:#151515;color:#eee}
+  #rotate{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:#000;font-size:22px;text-align:center;padding:30px}
+  video{position:fixed;width:1px;height:1px;opacity:0;pointer-events:none}
+</style>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+</head>
+<body>
+<div id="start">
+  <h1>НЕ ОДНИ</h1>
+  <p>Очки нужны с открытой задней камерой: игра покажет вашу комнату.<br>
+  Сначала отметьте взглядом три свободных места на полу. Потом просто смотрите по сторонам.<br>
+  Наклон головы вбок — включить свет. Тап по экрану — выход.</p>
+  <button id="go">Начать</button>
+</div>
+<div id="rotate">Поверните телефон горизонтально</div>
+<video id="cam" playsinline muted autoplay></video>
+<script type="module">
+import * as THREE from 'three';
+
+// 1 единица = 1 метр, глаза в начале координат, пол на y = -eyeH
+const DWELL = 1.5, ROLL_ON = 0.38, ROLL_OFF = 0.15;
+const VIDEO_HFOV = 68;                       // примерный угол задней камеры iPhone по горизонтали
+const params = new URLSearchParams(location.search);
+const TS = params.has('fast') ? 4 : 1;       // ?fast — ускорить сценарий для проверки
+const isMobile = /iPhone|iPad|Android/i.test(navigator.userAgent);
+const D2R = THREE.MathUtils.degToRad;
+
+// ---------- рендер ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, isMobile ? 1.5 : 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 200);
+camera.focus = 1000;                         // почти параллельные оси, как в картонных очках
+scene.add(camera);
+const stereo = new THREE.StereoCamera();
+stereo.eyeSep = 0.064;
+
+function makeCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+const GLSL_NOISE = `
+  float h3(vec3 p){ p=fract(p*0.3183099+.1); p*=17.; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+  float n3(vec3 x){ vec3 i=floor(x), f=fract(x); f=f*f*(3.-2.*f);
+    return mix(mix(mix(h3(i),h3(i+vec3(1,0,0)),f.x),mix(h3(i+vec3(0,1,0)),h3(i+vec3(1,1,0)),f.x),f.y),
+               mix(mix(h3(i+vec3(0,0,1)),h3(i+vec3(1,0,1)),f.x),mix(h3(i+vec3(0,1,1)),h3(i+vec3(1,1,1)),f.x),f.y),f.z); }`;
+
+// ---------- видео с камеры как фон, прикреплённый к голове ----------
+const video = document.getElementById('cam');
+const videoTex = new THREE.VideoTexture(video);
+videoTex.colorSpace = THREE.SRGBColorSpace;
+const fx = { light: { value: 0 }, flicker: { value: 1 }, time: { value: 0 }, fade: { value: 0 } };
+const VIDEO_D = 40;
+const videoPlane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.ShaderMaterial({
+  uniforms: { map: { value: videoTex }, light: fx.light, flicker: fx.flicker },
+  depthTest: false, depthWrite: false,
+  vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+  fragmentShader: `uniform sampler2D map; uniform float light, flicker; varying vec2 vUv;
+    void main(){
+      vec3 c=texture2D(map,vUv).rgb;
+      float l=dot(c,vec3(.299,.587,.114));
+      vec3 g=mix(vec3(l),c,.22);
+      g=pow(g,vec3(1.35))*.5*vec3(.88,1.,1.06);       // темнее, холоднее, почти без цвета
+      g=mix(g,c,light)*flicker;
+      float e=smoothstep(0.,.06,vUv.x)*smoothstep(1.,.94,vUv.x)*smoothstep(0.,.06,vUv.y)*smoothstep(1.,.94,vUv.y);
+      gl_FragColor=vec4(g*e,1.);
+      #include <colorspace_fragment>
+    }`,
+}));
+videoPlane.position.z = -VIDEO_D; videoPlane.renderOrder = -10; videoPlane.visible = false;
+camera.add(videoPlane);
+function fitVideo() {
+  const w = 2 * VIDEO_D * Math.tan(D2R(VIDEO_HFOV / 2));
+  const a = video.videoWidth && video.videoHeight ? video.videoHeight / video.videoWidth : 9 / 16;
+  videoPlane.scale.set(w, w * a, 1);
+}
+video.addEventListener('loadedmetadata', fitVideo);
+video.addEventListener('resize', fitVideo);
+let hasCamera = false;
+
+// оценка света в комнате по кадру
+const room = new THREE.Vector3(0.25, 0.25, 0.25);
+const probe = makeCanvas(16, 9), probeX = probe.getContext('2d', { willReadFrequently: true });
+let probeT = 0;
+function sampleRoom() {
+  if (!hasCamera || video.readyState < 2) return;
+  probeX.drawImage(video, 0, 0, 16, 9);
+  const d = probeX.getImageData(0, 0, 16, 9).data; let r = 0, g = 0, b = 0;
+  for (let i = 0; i < d.length; i += 4) { r += d[i]; g += d[i + 1]; b += d[i + 2]; }
+  const n = d.length / 4, lin = v => Math.pow(v / n / 255, 2.2);
+  room.lerp(new THREE.Vector3(lin(r), lin(g), lin(b)), 0.5);
+}
+
+// запасная тёмная комната, если камеры нет (на компьютере)
+const fallback = new THREE.Group(); scene.add(fallback);
+function buildFallback(eyeH) {
+  fallback.clear();
+  const m = new THREE.Mesh(new THREE.BoxGeometry(7, 2.8, 7), new THREE.ShaderMaterial({
+    side: THREE.BackSide, depthWrite: false, defines: { BRIGHT: params.has('bright') ? '6.' : '1.' },
+    vertexShader: `varying vec3 vP; void main(){ vP=position; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+    fragmentShader: `varying vec3 vP; void main(){ float k=(.035+.03*smoothstep(-1.4,1.4,vP.y))*BRIGHT;
+      vec2 g=abs(fract(vP.xz*1.)-.5); float line=(abs(vP.y+1.4)<.01)? smoothstep(.48,.5,max(g.x,g.y))*.05:0.;
+      gl_FragColor=vec4(vec3(k+line),1.); }`,
+  }));
+  m.position.y = 1.4 - eyeH; m.renderOrder = -10;
+  fallback.add(m);
+}
+buildFallback(1.2);
+
+// ---------- фигура ----------
+const figU = { time: fx.time, dissolve: { value: 1 }, room: { value: room }, light: fx.light };
+const makeFigMat = shroud => new THREE.ShaderMaterial({
+  uniforms: figU, transparent: true, side: shroud ? THREE.DoubleSide : THREE.FrontSide,
+  defines: shroud ? { SHROUD: 1 } : {},
+  vertexShader: `uniform float time; varying vec3 vN; varying vec3 vW; varying vec2 vUv;
+    ${GLSL_NOISE}
+    void main(){ vUv=uv; vec3 p=position;
+      #ifdef SHROUD
+        float k=1.-uv.y;                                   // низ савана колышется сильнее
+        p.xz+=normalize(p.xz)*(n3(vec3(p.xz*6.,time*.4+p.y*3.))-.5)*.09*k;
+      #endif
+      vN=normalize(mat3(modelMatrix)*normal); vec4 w=modelMatrix*vec4(p,1.); vW=w.xyz; gl_Position=projectionMatrix*viewMatrix*w; }`,
+  fragmentShader: `uniform float time, dissolve, light; uniform vec3 room; varying vec3 vN; varying vec3 vW; varying vec2 vUv;
+    ${GLSL_NOISE}
+    void main(){
+      #ifdef SHROUD
+        float rag=n3(vec3(vUv.x*38.,vUv.y*3.,time*.15))*.55+n3(vec3(vUv.x*90.,2.,time*.1))*.3;
+        if(vUv.y<rag*.3) discard;                          // рваный подол
+      #endif
+      float n=n3(vW*9.+vec3(0.,time*.35,0.))*.6+n3(vW*24.-vec3(time*.5))*.4;
+      if(n<dissolve*1.15-.08) discard;                              // растворение «дымом»
+      vec3 nn=normalize(vN), v=normalize(cameraPosition-vW);
+      float fres=1.-abs(dot(nn,v));
+      float a=1.-smoothstep(.5,1.,fres+(n-.5)*.6);                   // рваный дымный край
+      a*=1.-smoothstep(.0,.2,dissolve*1.15-.08-n+.2)*0.;
+      vec3 base=vec3(.004,.004,.005)+room*.04+room*.1*max(dot(nn,normalize(vec3(.2,1.,.4))),0.);
+      base*=1.+light*2.5;
+      gl_FragColor=vec4(base,a*.95);
+      #include <colorspace_fragment>
+    }`,
+});
+const figMat = makeFigMat(false), shroudMat = makeFigMat(true);
+const fig = new THREE.Group(); fig.visible = false; scene.add(fig);
+const J = {};
+function capsule(r, len, parent, y, sx = 1, sz = 1) {
+  const m = new THREE.Mesh(new THREE.CapsuleGeometry(r, len, 6, 14), figMat);
+  m.position.y = y; m.scale.set(sx, 1, sz); parent.add(m); return m;
+}
+function joint(parent, x, y, z) { const j = new THREE.Group(); j.position.set(x, y, z); parent.add(j); return j; }
+{
+  J.hips = joint(fig, 0, 1.08, 0);
+  capsule(0.11, 0.42, J.hips, 0.27, 1.3, 0.7);                          // туловище
+  J.chest = joint(J.hips, 0, 0.55, 0);
+  J.chest.rotation.x = 0.26;
+  J.neck = joint(J.chest, 0, 0.1, 0.02); J.neck.rotation.x = 0.4;
+  capsule(0.038, 0.2, J.neck, 0.1);
+  { const sh = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.34, 1.65, 48, 32, true), shroudMat);
+    sh.position.y = -0.78; J.chest.add(sh); sh.rotation.x = -0.22; }
+  J.head = joint(J.neck, 0, 0.21, 0.01);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.11, 24, 18), figMat);
+  head.scale.set(0.82, 1.3, 0.95); head.position.y = 0.11; J.head.add(head);
+  // бледные отблески вместо глаз
+  const eyeTex = (() => { const c = makeCanvas(64, 64), x = c.getContext('2d'); const g = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+    g.addColorStop(0, 'rgba(230,235,240,1)'); g.addColorStop(.25, 'rgba(200,210,220,.35)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+    x.fillStyle = g; x.fillRect(0, 0, 64, 64); return new THREE.CanvasTexture(c); })();
+  J.eyes = [];
+  for (const s of [-1, 1]) {
+    const e = new THREE.Sprite(new THREE.SpriteMaterial({ map: eyeTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, opacity: 0.3 }));
+    e.scale.setScalar(0.035); e.position.set(s * 0.033, 0.13, 0.1); J.head.add(e); J.eyes.push(e);
+  }
+  J.arms = []; J.fingers = [];
+  for (const s of [-1, 1]) {
+    const sh = joint(J.chest, s * 0.2, 0.07, 0);
+    sh.rotation.z = s * 0.1; sh.rotation.x = -0.2;
+    capsule(0.038, 0.4, sh, -0.22);
+    const el = joint(sh, 0, -0.44, 0); el.rotation.x = -0.12;
+    capsule(0.03, 0.46, el, -0.25);
+    const wr = joint(el, 0, -0.5, 0);
+    capsule(0.028, 0.08, wr, -0.05, 1.3, 0.6);
+    for (let i = 0; i < 4; i++) {
+      const f = joint(wr, (i - 1.5) * 0.017 * s, -0.1, 0);
+      capsule(0.005, 0.25 - Math.abs(i - 1.5) * 0.03, f, -0.13);
+      J.fingers.push(f);
+    }
+    J.arms.push({ sh, el, s });
+    const hip = joint(J.hips, s * 0.08, 0, 0); hip.rotation.x = -0.1;
+    capsule(0.052, 0.46, hip, -0.26);
+    const kn = joint(hip, 0, -0.52, 0); kn.rotation.x = 0.18;
+    capsule(0.042, 0.46, kn, -0.25);
+    const ft = joint(kn, 0, -0.5, 0.03);
+    const foot = capsule(0.035, 0.14, ft, 0); foot.rotation.x = Math.PI / 2;
+  }
+  // мягкая тень под ногами
+  const c = makeCanvas(128, 128), x = c.getContext('2d'); const g = x.createRadialGradient(64, 64, 0, 64, 64, 64);
+  g.addColorStop(0, 'rgba(0,0,0,.75)'); g.addColorStop(1, 'rgba(0,0,0,0)'); x.fillStyle = g; x.fillRect(0, 0, 128, 128);
+  J.shadow = new THREE.Mesh(new THREE.PlaneGeometry(1.0, 0.75), new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthWrite: false }));
+  J.shadow.rotation.x = -Math.PI / 2; J.shadow.position.y = 0.01; J.shadow.renderOrder = -5; fig.add(J.shadow);
+}
+let headTilt = 0.5, headTiltTarget = 0.5, jerkT = 3, headYaw = 0;
+function animateFigure(dt, frozen, t) {
+  if (!frozen) {
+    J.chest.scale.y = 1 + 0.012 * Math.sin(t * 1.1);
+    J.fingers.forEach((f, i) => f.rotation.x = 0.15 * Math.sin(t * 0.7 + i * 1.7) * Math.sin(t * 0.23 + i));
+    J.arms.forEach(a => a.sh.rotation.x = -0.2 + 0.03 * Math.sin(t * 0.5 + a.s));
+    jerkT -= dt;
+    if (jerkT < 0) { jerkT = 3 + Math.random() * 6; headTiltTarget = (Math.random() < 0.75 ? 1 : -1) * (0.3 + Math.random() * 0.5); }
+    headTilt += (headTiltTarget - headTilt) * Math.min(1, dt * 18);          // резкий рывок головы
+  }
+  // голова медленно поворачивается к вам, даже когда фигура замерла
+  const toCam = fig.worldToLocal(camera.position.clone());
+  const want = Math.max(-1, Math.min(1, Math.atan2(toCam.x, toCam.z)));
+  headYaw += (want - headYaw) * Math.min(1, dt * 0.4);
+  J.head.rotation.set(-0.5, headYaw, headTilt);
+  const d = figU.dissolve.value;
+  J.eyes.forEach(e => e.material.opacity = 0.3 * (1 - d) * (1 - fx.light.value));
+  J.shadow.material.opacity = 1 - d;
+}
+
+// ---------- HUD на холстах, прикреплённый к камере ----------
+const hud = new THREE.Group(); camera.add(hud);
+function hudPlane(cw, ch, w, h, z, y = 0) {
+  const c = makeCanvas(cw, ch); const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false }));
+  m.position.set(0, y, -z); m.renderOrder = 20; hud.add(m);
+  return { c, x: c.getContext('2d'), tex, m };
+}
+const reticle = hudPlane(128, 128, 0.06, 0.06, 1.5);
+const panel = hudPlane(1024, 300, 0.9, 0.264, 1.5, -0.12);
+function drawReticle(p, show) {
+  const { x, tex, m } = reticle; m.visible = show; if (!show) return;
+  x.clearRect(0, 0, 128, 128);
+  x.fillStyle = 'rgba(255,255,255,.7)'; x.beginPath(); x.arc(64, 64, 4, 0, 7); x.fill();
+  if (p > 0) { x.strokeStyle = 'rgba(255,255,255,.75)'; x.lineWidth = 5; x.beginPath(); x.arc(64, 64, 24, -Math.PI / 2, -Math.PI / 2 + p * Math.PI * 2); x.stroke(); }
+  tex.needsUpdate = true;
+}
+let panelTimer = 0;
+function showPanel(text, secs = 6) {
+  const { x, tex } = panel; x.clearRect(0, 0, 1024, 300);
+  x.fillStyle = '#ddd'; x.font = '46px -apple-system,system-ui,sans-serif'; x.textAlign = 'center';
+  x.shadowColor = '#000'; x.shadowBlur = 12;
+  text.split('\n').forEach((l, i, a) => x.fillText(l, 512, 150 - (a.length - 1) * 30 + i * 60));
+  tex.needsUpdate = true; panelTimer = secs;
+}
+// общий слой поверх всего: зерно, виньетка, затемнение — одинаково для видео и фигуры
+const grain = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.ShaderMaterial({
+  uniforms: { time: fx.time, fade: fx.fade }, transparent: true, depthTest: false, depthWrite: false,
+  vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+  fragmentShader: `uniform float time, fade; varying vec2 vUv;
+    float r(vec2 p){ return fract(sin(dot(p,vec2(12.9898,78.233))+time*7.)*43758.5453); }
+    void main(){
+      vec2 q=vUv-.5; float vig=smoothstep(.25,.75,length(q*vec2(1.,1.15)));
+      float n=r(floor(gl_FragCoord.xy/1.5));
+      float a=max(vig*.85,fade);
+      vec3 c=vec3(n*.09)*(1.-fade);
+      gl_FragColor=vec4(c,max(a,.06));
+    }`,
+}));
+grain.position.z = -0.3; grain.renderOrder = 15; camera.add(grain);
+function fitGrain() {
+  const h = 2 * 0.3 * Math.tan(D2R(camera.fov / 2)) * 1.02;
+  grain.scale.set(h * camera.aspect, h, 1);
+}
+
+// ---------- ориентация: гироскоп и мышь ----------
+const zee = new THREE.Vector3(0, 0, 1), q0 = new THREE.Quaternion(), q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
+const devEuler = new THREE.Euler(), devQ = new THREE.Quaternion(), yawFix = new THREE.Quaternion();
+let gotOrientation = false, needRecenter = false;
+function onOrient(e) {
+  if (e.alpha == null) return;
+  const orient = D2R(screen.orientation ? screen.orientation.angle : (window.orientation || 0));
+  devEuler.set(D2R(e.beta), D2R(e.alpha), -D2R(e.gamma), 'YXZ');
+  devQ.setFromEuler(devEuler).multiply(q1).multiply(q0.setFromAxisAngle(zee, -orient));
+  gotOrientation = true;
+  if (needRecenter) recenter();
+}
+function recenter() {
+  const yaw = new THREE.Euler().setFromQuaternion(devQ, 'YXZ').y;
+  yawFix.setFromAxisAngle(new THREE.Vector3(0, 1, 0), -yaw); needRecenter = false;
+}
+let mYaw = 0, mPitch = 0, fakeRoll = 0, drag = null;
+renderer.domElement.addEventListener('pointerdown', e => { if (e.pointerType === 'mouse') drag = [e.clientX, e.clientY]; });
+addEventListener('pointerup', () => drag = null);
+addEventListener('pointermove', e => {
+  if (!drag) return;
+  mYaw += (e.clientX - drag[0]) * 0.004; mPitch += (e.clientY - drag[1]) * 0.004;
+  mPitch = Math.max(-1.5, Math.min(1.5, mPitch)); drag = [e.clientX, e.clientY];
+});
+addEventListener('keydown', e => {           // Q/E — имитация наклона головы, Esc — выход
+  if (e.key === 'q' || e.key === 'й') fakeRoll = 0.5;
+  if (e.key === 'e' || e.key === 'у') fakeRoll = -0.5;
+  if (e.key === 'Escape') exitVR();
+});
+addEventListener('keyup', e => { if ('qeйу'.includes(e.key)) fakeRoll = 0; });
+
+// ---------- вход и выход ----------
+let vr = false, audio = null;
+const startEl = document.getElementById('start'), rotateEl = document.getElementById('rotate');
+document.getElementById('go').addEventListener('click', () => {
+  // всё в том же тапе, до любого await
+  try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); audio.resume(); } catch {}
+  if (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function') {
+    DeviceOrientationEvent.requestPermission().then(s => { if (s === 'granted') addEventListener('deviceorientation', onOrient); }).catch(() => {});
+  } else addEventListener('deviceorientation', onOrient);
+  if (!hasCamera && navigator.mediaDevices?.getUserMedia) {
+    navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } } })
+      .then(stream => { video.srcObject = stream; video.play().catch(() => {}); hasCamera = true; videoPlane.visible = true; fallback.visible = false; })
+      .catch(() => {});
+  }
+  try { const r = document.documentElement.requestFullscreen?.(); r && r.catch(() => {}); } catch {}
+  try { const r = screen.orientation?.lock?.('landscape'); r && r.catch(() => {}); } catch {}
+  vr = true; needRecenter = true; if (gotOrientation) recenter();
+  startEl.style.display = 'none'; hud.visible = true;
+  startCalibration();
+  onResize();
+});
+function exitVR() {
+  if (!vr) return;
+  vr = false; startEl.style.display = 'flex'; rotateEl.style.display = 'none';
+  try { document.fullscreenElement && document.exitFullscreen().catch(() => {}); } catch {}
+  onResize();
+}
+renderer.domElement.addEventListener('pointerup', e => { if (vr && e.pointerType === 'touch') exitVR(); });
+function onResize() {
+  renderer.setSize(innerWidth, innerHeight);
+  rotateEl.style.display = vr && innerHeight > innerWidth && isMobile ? 'flex' : 'none';
+  if (vr) { camera.fov = 80; camera.aspect = (innerWidth / 2) / innerHeight; }
+  else { camera.fov = 70; camera.aspect = innerWidth / innerHeight; }
+  camera.updateProjectionMatrix(); fitGrain();
+}
+addEventListener('resize', onResize);
+addEventListener('orientationchange', () => setTimeout(onResize, 300));
+
+// ---------- калибровка: сидите или стоите, три свободных места на полу ----------
+let mode = 'idle', eyeH = 1.2, spots = [];
+const choice = new THREE.Group(); scene.add(choice);
+function choicePanel(text, x) {
+  const c = makeCanvas(512, 200), g = c.getContext('2d');
+  g.fillStyle = 'rgba(20,20,20,.75)'; g.beginPath(); g.roundRect(6, 6, 500, 188, 30); g.fill();
+  g.strokeStyle = 'rgba(255,255,255,.35)'; g.lineWidth = 3; g.stroke();
+  g.fillStyle = '#e8e8e8'; g.font = '64px -apple-system,system-ui,sans-serif'; g.textAlign = 'center'; g.fillText(text, 256, 122);
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 0.234), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false }));
+  m.position.set(x, -0.1, -2); m.renderOrder = 19; choice.add(m); return m;
+}
+const btnSit = choicePanel('Я сижу', -0.42), btnStand = choicePanel('Я стою', 0.42);
+choice.visible = false;
+const marker = new THREE.Mesh(new THREE.RingGeometry(0.16, 0.2, 48), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5, depthTest: false, side: THREE.DoubleSide }));
+marker.rotation.x = -Math.PI / 2; marker.renderOrder = 18; marker.visible = false; scene.add(marker);
+const spotMarks = new THREE.Group(); scene.add(spotMarks);
+function startCalibration() {
+  mode = 'choose'; spots = []; spotMarks.clear(); choice.visible = true; fig.visible = false;
+  fx.fade.value = 0; finale = 0;
+  showPanel('Вы сидите или стоите?\nЗадержите взгляд на ответе', 999);
+  panel.m.position.y = 0.12;
+  if (params.has('show')) {               // ?show — сразу показать фигуру впереди (для проверки)
+    mode = 'debug'; choice.visible = false; panelTimer = 0;
+    placeFig(new THREE.Vector3(0.3, 0, -2.4)); fig.visible = true; figU.dissolve.value = 0;
+  }
+}
+
+// ---------- сценарий ----------
+const SPAWN_GAP = [[6, 10], [4, 7], [3, 5]];
+let T = 0, phase = 0, figState = 'hidden', figTimer = 3, seenT = 0, outT = 0, lightT = 0, lightCD = 0;
+let flickT = 12, finale = 0, finaleT = 0, rollArmed = true;
+let dwellT = 0, dwellKey = null;
+const fwd = new THREE.Vector3(), tmp = new THREE.Vector3(), rollEuler = new THREE.Euler();
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+function angleToFig() { tmp.copy(fig.position).add(new THREE.Vector3(0, 1.5, 0)).sub(camera.position).normalize(); return fwd.angleTo(tmp); }
+function placeFig(p) {
+  fig.position.copy(p); fig.position.y = -eyeH;
+  fig.lookAt(camera.position.x, fig.position.y, camera.position.z);
+  headYaw = 0;
+}
+function spawn() {
+  // только там, куда вы сейчас не смотрите
+  const opts = spots.filter(s => { tmp.copy(s).setY(0).normalize(); return tmp.angleTo(fwd.clone().setY(0).normalize()) > D2R(100); });
+  if (!opts.length) return false;
+  let p = opts[Math.floor(Math.random() * opts.length)].clone();
+  if (phase === 2) p.multiplyScalar(Math.max(1.0 / p.length(), rnd(0.35, 0.55)));
+  placeFig(p); fig.visible = true; figState = 'in'; figU.dissolve.value = 1; seenT = 0; outT = 0;
+  if (phase === 2) flick(0.2);
+  return true;
+}
+function flick(len) { flickT = -len; }
+
+function story(dt) {
+  T += dt * TS;
+  phase = T < 90 ? 0 : T < 200 ? 1 : 2;
+  const a = fig.visible ? angleToFig() : Math.PI;
+
+  // мигание света
+  flickT -= dt;
+  if (flickT < 0 && flickT > -0.4) fx.flicker.value = 0.25 + 0.2 * Math.random();
+  else { fx.flicker.value += (1 - fx.flicker.value) * Math.min(1, dt * 10); if (flickT <= -0.4) flickT = phase ? rnd(10, 25) / TS : 30; }
+
+  // наклон головы — включить свет
+  lightCD -= dt; lightT -= dt;
+  fx.light.value += ((lightT > 0 ? 1 : 0) - fx.light.value) * Math.min(1, dt * 4);
+
+  if (finale) return storyFinale(dt, a);
+  if (T > 270) {                              // финал: она оказывается прямо за спиной
+    if (figState === 'hidden' || a > D2R(70)) {
+      const back = fwd.clone().setY(0).normalize().multiplyScalar(-0.85);
+      placeFig(back); fig.visible = true; figU.dissolve.value = 0; figState = 'final'; finale = 1; finaleT = 0;
+    }
+  }
+
+  if (figState === 'hidden') {
+    figTimer -= dt * TS;
+    if (figTimer < 0 && !spawn()) figTimer = 0.5;
+    return;
+  }
+  if (lightT > 0) figState = 'out';
+  if (figState === 'in') {                      // проявляется, пока вы не смотрите
+    figU.dissolve.value = Math.max(0, figU.dissolve.value - dt * 0.8);
+    if (figU.dissolve.value === 0) figState = 'present';
+  }
+  if (figState === 'present' || figState === 'in') {
+    if (phase === 0 && a < D2R(32)) figState = 'outfast';              // мелькнула на краю — и нет
+    else if (a < D2R(14)) { seenT += dt; if (seenT > 2.5) figState = 'out'; }
+    else if (a > D2R(70)) {
+      outT += dt * TS;
+      if (phase === 2 && outT > 3) {                                     // подходит ближе, пока не смотрите
+        outT = 0; const p = fig.position.clone().setY(0); if (p.length() > 1.0) placeFig(p.multiplyScalar(0.8));
+      }
+    }
+  }
+  if (figState === 'out' || figState === 'outfast') {
+    figU.dissolve.value += dt * (figState === 'outfast' || lightT > 0 ? 1.3 : 0.5);
+    if (figU.dissolve.value >= 1) {
+      figState = 'hidden'; fig.visible = false; const g = SPAWN_GAP[phase]; figTimer = rnd(g[0], g[1]);
+    }
+  }
+}
+function storyFinale(dt, a) {
+  finaleT += dt;
+  if (finale === 1 && a < D2R(22)) { finale = 2; finaleT = 0; }
+  if (finale === 2 && finaleT > 1.3) { finale = 3; finaleT = 0; }
+  if (finale === 3) {
+    fx.fade.value = Math.min(1, finaleT / 2.5);
+    if (fx.fade.value >= 1) { finale = 4; showPanel('Вы не одни.\n\nТап по экрану — выход', 999); panel.m.position.y = 0; }
+  }
+}
+
+// ---------- цикл ----------
+const clock = new THREE.Clock();
+function frame() {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  fx.time.value += dt;
+
+  if (gotOrientation) camera.quaternion.copy(yawFix).multiply(devQ);
+  else camera.quaternion.setFromEuler(new THREE.Euler(-mPitch, -mYaw, fakeRoll, 'YXZ'));
+  camera.updateMatrixWorld();
+  camera.getWorldDirection(fwd);
+
+  if (vr) {
+    const roll = rollEuler.setFromQuaternion(camera.quaternion, 'YXZ').z;
+    let tilted = false;
+    if (rollArmed && Math.abs(roll) > ROLL_ON) { rollArmed = false; tilted = true; }
+    else if (!rollArmed && Math.abs(roll) < ROLL_OFF) rollArmed = true;
+
+    probeT -= dt; if (probeT < 0) { probeT = 0.5; sampleRoom(); }
+    if (!hasCamera) room.setScalar(params.has('bright') ? 0.3 : 0.05);
+
+    let prog = 0, showRet = false;
+    if (mode === 'choose') {
+      showRet = true;
+      const hit = [[btnSit, 1.2], [btnStand, 1.6]].find(([b]) => fwd.angleTo(tmp.copy(b.position).normalize()) < 0.12);
+      const key = hit ? hit[1] : null;
+      if (key !== dwellKey) { dwellKey = key; dwellT = 0; }
+      if (key) { dwellT += dt; prog = dwellT / DWELL; }
+      if (key && dwellT >= DWELL) {
+        eyeH = key; buildFallback(eyeH); choice.visible = false; mode = 'spots'; dwellKey = null; dwellT = 0;
+        showPanel('Посмотрите на свободное место\nна полу и задержите взгляд (3)', 999);
+      }
+    } else if (mode === 'spots') {
+      showRet = true;
+      marker.visible = false;
+      if (fwd.y < -0.12) {
+        const p = fwd.clone().multiplyScalar(-eyeH / fwd.y); p.y = -eyeH;
+        const d = Math.hypot(p.x, p.z);
+        if (d > 1.0 && d < 6) {
+          marker.visible = true; marker.position.copy(p);
+          const near = dwellKey && dwellKey.distanceTo(p) < 0.35;
+          if (!near) { dwellKey = p.clone(); dwellT = 0; }
+          dwellT += dt; prog = dwellT / DWELL; marker.scale.setScalar(0.6 + 0.4 * Math.min(1, prog));
+          if (dwellT >= DWELL) {
+            spots.push(new THREE.Vector3(p.x, 0, p.z)); dwellKey = null; dwellT = 0;
+            const mk = marker.clone(); mk.material = marker.material.clone(); mk.material.opacity = 0.25; spotMarks.add(mk);
+            if (spots.length < 3) showPanel(`Ещё одно свободное место (${3 - spots.length})`, 999);
+            else {
+              mode = 'play'; marker.visible = false; T = 0; figState = 'hidden'; figTimer = 4; flickT = 30;
+              setTimeout(() => spotMarks.clear(), 1500);
+              showPanel('Готово.\nПросто смотрите по сторонам.', 4);
+            }
+          }
+        }
+      }
+    } else if (mode === 'play') {
+      if (tilted && finale === 0) {
+        if (lightCD <= 0) { lightT = 3; lightCD = 15; } else showPanel('Свет не включается…', 2);
+      }
+      story(dt);
+      if (fig.visible) animateFigure(dt, figState === 'present' && seenT > 0 && angleToFig() < D2R(14), fx.time.value);
+    }
+    if (mode === 'debug') animateFigure(dt, false, fx.time.value);
+    drawReticle(Math.min(1, prog), showRet);
+    panelTimer -= dt;
+    panel.m.material.opacity = Math.max(0, Math.min(1, panelTimer));
+  }
+
+  const w = innerWidth, h = innerHeight;
+  if (vr) {
+    stereo.update(camera);
+    renderer.setScissorTest(true);
+    renderer.setScissor(0, 0, w / 2, h); renderer.setViewport(0, 0, w / 2, h); renderer.render(scene, stereo.cameraL);
+    renderer.setScissor(w / 2, 0, w / 2, h); renderer.setViewport(w / 2, 0, w / 2, h); renderer.render(scene, stereo.cameraR);
+    renderer.setScissorTest(false);
+  } else {
+    renderer.setViewport(0, 0, w, h); renderer.render(scene, camera);
+  }
+  requestAnimationFrame(frame);
+}
+hud.visible = true;
+onResize(); fitVideo(); frame();
+</script>
+</body>
+</html>
